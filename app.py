@@ -23,28 +23,63 @@ NAME_MAP = {
 
 @st.cache_data(ttl=3600)
 def get_data(ticker):
-    data = yf.download(
-        ticker,
-        start="2015-01-01",
-        end=pd.Timestamp.today().strftime("%Y-%m-%d"),
-        auto_adjust=False,
-        progress=False,
-    )
+    """Download historical daily Close prices with a fallback method."""
+    last_error = None
 
-    if data.empty:
-        return pd.DataFrame()
+    # Method 1: Ticker.history(period="max") is generally more robust on hosted servers.
+    try:
+        data = yf.Ticker(ticker).history(
+            period="max",
+            interval="1d",
+            auto_adjust=False,
+            actions=False,
+            timeout=30,
+        )
 
-    # yfinance can return a MultiIndex for a single ticker.
-    if isinstance(data.columns, pd.MultiIndex):
-        if ticker in data.columns.get_level_values(-1):
-            data = data.xs(ticker, axis=1, level=-1)
-        else:
-            data.columns = data.columns.get_level_values(0)
+        if data is not None and not data.empty and "Close" in data.columns:
+            data = data.reset_index()
+            data["Close"] = pd.to_numeric(data["Close"], errors="coerce")
+            data = data.dropna(subset=["Close"]).copy()
+            if len(data) > 70:
+                return data
+    except Exception as exc:
+        last_error = exc
 
-    data = data.reset_index()
-    data["Close"] = pd.to_numeric(data["Close"], errors="coerce")
-    data = data.dropna(subset=["Close"]).copy()
-    return data
+    # Method 2: fallback to yf.download().
+    try:
+        data = yf.download(
+            ticker,
+            period="max",
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            timeout=30,
+        )
+
+        if data is not None and not data.empty:
+            if isinstance(data.columns, pd.MultiIndex):
+                # For a single ticker, keep the OHLC level.
+                if ticker in data.columns.get_level_values(-1):
+                    data = data.xs(ticker, axis=1, level=-1)
+                else:
+                    data.columns = data.columns.get_level_values(0)
+
+            if "Close" in data.columns:
+                data = data.reset_index()
+                data["Close"] = pd.to_numeric(data["Close"], errors="coerce")
+                data = data.dropna(subset=["Close"]).copy()
+                if len(data) > 70:
+                    return data
+    except Exception as exc:
+        last_error = exc
+
+    if last_error:
+        raise ValueError(
+            f"Yahoo Finance could not return data for '{ticker}'. "
+            "Check the symbol and try again."
+        )
+
+    return pd.DataFrame()
 
 def build_sequences(close_prices, window_size=60):
     scaler = MinMaxScaler(feature_range=(0, 1))
@@ -69,8 +104,17 @@ def build_sequences(close_prices, window_size=60):
 def train_and_predict(ticker, epochs, window_size):
     data = get_data(ticker)
 
+    if data.empty:
+        raise ValueError(
+            f"No historical data was returned for '{ticker}'. "
+            "Check the ticker symbol or try again in a moment."
+        )
+
     if len(data) <= window_size + 10:
-        raise ValueError("Not enough historical data for this ticker.")
+        raise ValueError(
+            f"Only {len(data)} historical observations were returned for "
+            f"'{ticker}', which is not enough for a {window_size}-day window."
+        )
 
     close_prices = data["Close"].values.astype(float)
     X_train, X_test, y_train, y_test, scaler = build_sequences(
